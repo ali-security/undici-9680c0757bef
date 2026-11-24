@@ -366,6 +366,228 @@ test('cache does not store a cross-origin redirect response when a copying inter
   })
 })
 
+// GHSA-5RM8-GV32-R954: a conditional revalidation request carries the cached
+// entry's validators. If it is redirected, the 304 comes from a different URL
+// (or origin) than the one the entry is keyed on, and must not be accepted as
+// validation of the stored response. The primed responses use `no-cache` so
+// every reuse is preceded by a revalidation request.
+for (const redirectType of ['same-origin', 'cross-origin']) {
+  test(`a ${redirectType} 304 after a redirect cannot validate the original cached response`, async () => {
+    const targetValidators = []
+    let targetOrigin
+
+    const target = redirectType === 'cross-origin'
+      ? createServer((req, res) => {
+        const validator = req.headers['if-none-match']
+        targetValidators.push(validator)
+        if (validator) {
+          res.writeHead(304, { etag: '"trusted-private"' })
+        } else {
+          res.writeHead(200, { 'cache-control': 'no-store' })
+          res.write('target-response')
+        }
+        res.end()
+      })
+      : undefined
+
+    if (target) {
+      await listen(target)
+      targetOrigin = `http://127.0.0.1:${target.address().port}`
+    }
+
+    const trusted = createServer((req, res) => {
+      if (req.url === '/resource' && req.headers.authorization === 'Bearer alice') {
+        res.writeHead(200, {
+          'cache-control': 'no-cache, must-revalidate, max-age=60',
+          etag: '"trusted-private"'
+        })
+        res.end('alice-private-response')
+        return
+      }
+
+      if (req.url === '/resource') {
+        res.writeHead(302, {
+          'cache-control': 'private, no-store',
+          location: redirectType === 'cross-origin' ? `${targetOrigin}/validate` : '/validate'
+        })
+        res.end()
+        return
+      }
+
+      const validator = req.headers['if-none-match']
+      targetValidators.push(validator)
+      if (validator) {
+        res.writeHead(304, { etag: '"trusted-private"' })
+      } else {
+        res.writeHead(200, { 'cache-control': 'no-store' })
+        res.write('target-response')
+      }
+      res.end()
+    })
+
+    await listen(trusted)
+    const trustedOrigin = `http://127.0.0.1:${trusted.address().port}`
+    const agent = new Agent().compose(
+      interceptors.redirect({ maxRedirections: 2 }),
+      interceptors.cache({
+        store: new cacheStores.MemoryCacheStore(),
+        type: 'shared'
+      })
+    )
+
+    try {
+      const prime = await agent.request({
+        origin: trustedOrigin,
+        path: '/resource',
+        method: 'GET',
+        headers: { authorization: 'Bearer alice' }
+      })
+      assert.equal(await prime.body.text(), 'alice-private-response')
+
+      const revalidated = await agent.request({
+        origin: trustedOrigin,
+        path: '/resource',
+        method: 'GET'
+      })
+
+      assert.equal(revalidated.statusCode, 200)
+      assert.equal(await revalidated.body.text(), 'target-response')
+      assert.deepEqual(targetValidators, ['"trusted-private"', undefined])
+    } finally {
+      await agent.close()
+      await closeServer(trusted)
+      if (target) {
+        await closeServer(target)
+      }
+    }
+  })
+}
+
+test('a mismatched strong ETag cannot validate a cached response', async () => {
+  const validators = []
+  const server = createServer((req, res) => {
+    if (req.headers.authorization === 'Bearer alice') {
+      res.writeHead(200, {
+        'cache-control': 'no-cache, must-revalidate, max-age=60',
+        etag: '"trusted-private"'
+      })
+      res.end('alice-private-response')
+      return
+    }
+
+    const validator = req.headers['if-none-match']
+    validators.push(validator)
+    if (validator) {
+      res.writeHead(304, { etag: '"mismatched"' })
+    } else {
+      res.writeHead(200, { 'cache-control': 'no-store' })
+      res.write('replacement-response')
+    }
+    res.end()
+  })
+
+  await listen(server)
+  const origin = `http://127.0.0.1:${server.address().port}`
+  const agent = new Agent().compose(interceptors.cache({
+    store: new cacheStores.MemoryCacheStore(),
+    type: 'shared'
+  }))
+
+  try {
+    const prime = await agent.request({
+      origin,
+      path: '/resource',
+      method: 'GET',
+      headers: { authorization: 'Bearer alice' }
+    })
+    assert.equal(await prime.body.text(), 'alice-private-response')
+
+    const revalidated = await agent.request({
+      origin,
+      path: '/resource',
+      method: 'GET'
+    })
+
+    assert.equal(revalidated.statusCode, 200)
+    assert.equal(await revalidated.body.text(), 'replacement-response')
+    assert.deepEqual(validators, ['"trusted-private"', undefined])
+  } finally {
+    await agent.close()
+    await closeServer(server)
+  }
+})
+
+test('a cross-origin 304 to an If-Modified-Since revalidation after a redirect cannot validate the original cached response', async () => {
+  const lastModified = 'Wed, 01 Jan 2020 00:00:00 GMT'
+  const targetValidators = []
+
+  const target = createServer((req, res) => {
+    const validator = req.headers['if-modified-since']
+    targetValidators.push(validator)
+    if (validator) {
+      res.writeHead(304)
+    } else {
+      res.writeHead(200, { 'cache-control': 'no-store' })
+      res.write('target-response')
+    }
+    res.end()
+  })
+
+  await listen(target)
+  const targetOrigin = `http://127.0.0.1:${target.address().port}`
+
+  const trusted = createServer((req, res) => {
+    if (req.url === '/resource' && req.headers.authorization === 'Bearer alice') {
+      res.writeHead(200, {
+        'cache-control': 'no-cache, must-revalidate, max-age=60',
+        'last-modified': lastModified
+      })
+      res.end('alice-private-response')
+      return
+    }
+
+    res.writeHead(302, {
+      'cache-control': 'private, no-store',
+      location: `${targetOrigin}/validate`
+    })
+    res.end()
+  })
+
+  await listen(trusted)
+  const trustedOrigin = `http://127.0.0.1:${trusted.address().port}`
+  const agent = new Agent().compose(
+    interceptors.redirect({ maxRedirections: 2 }),
+    interceptors.cache({
+      store: new cacheStores.MemoryCacheStore(),
+      type: 'shared'
+    })
+  )
+
+  try {
+    const prime = await agent.request({
+      origin: trustedOrigin,
+      path: '/resource',
+      method: 'GET',
+      headers: { authorization: 'Bearer alice' }
+    })
+    assert.equal(await prime.body.text(), 'alice-private-response')
+
+    const revalidated = await agent.request({
+      origin: trustedOrigin,
+      path: '/resource',
+      method: 'GET'
+    })
+
+    assert.equal(revalidated.statusCode, 200)
+    assert.equal(await revalidated.body.text(), 'target-response')
+    assert.deepEqual(targetValidators, [lastModified, undefined])
+  } finally {
+    await agent.close()
+    await closeServer(trusted)
+    await closeServer(target)
+  }
+})
+
 // Deduplicated requests that join an in-flight request before it starts receive
 // the response through a separate replay path. That path must still carry the
 // redirect history, otherwise a joined request caches a cross-origin redirect
